@@ -39,8 +39,7 @@
 
 ## What This Does
 
-<!-- Three or four sentences: what a user asks for, and what they get back. -->
-
+FitFindr takes a plain-language thrift request like *"a vintage graphic tee under $30, size M"*, pulls a description, size and price ceiling out of it, and searches 40 listings from Depop, ThredUp and Poshmark. If something matches, it picks the best match, asks the model for two outfits that use pieces from the user's own wardrobe, and then writes a short caption the user could post, mentioning the item, its price and its platform. If nothing matches, it stops before any model call and tells the user which filters it applied and what to loosen.
 
 
 ---
@@ -98,9 +97,11 @@
 
 **Where it lives:** `agent.py::run_agent`
 
-**How the query is parsed:** <!-- regex, string splitting, or asking the model — say which -->
+**How the query is parsed:** Regex, in `agent.py::parse_query`. No model call. A price comes from `under $30`, `under 50 dollars`, `max $20`, `up to 40` or a bare `$30`. A size comes from `size M`, `in size M`, `size 8`, `size W30` or `in M`. Whatever's left, minus commas, becomes the description, and `search_listings` drops filler words like "looking for a" itself.
 
-**What moves through the session:** <!-- which fields, in what order -->
+**How the loop runs:** `run_agent` is a `while` loop driven by `session["next_step"]` (`parse` → `search` → `suggest` → `card` → `done`). Each pass calls `trace.check_iterations(count)` and then does the one step the session names. The `search` step is the only place where two different next steps are possible, and that's the branch.
+
+**What moves through the session:** `query` → `parsed` (`description`, `size`, `max_price`) → `search_results` (the list `search_listings` returned) → `selected_item` (`search_results[0]`) → `outfit_suggestion` → `fit_card`. Each tool reads its inputs back out of the session, not from a local variable, so `suggest_outfit` gets `session["selected_item"]` and `create_fit_card` gets `session["outfit_suggestion"]` plus that same `session["selected_item"]`. `session["tool_calls"]` records every tool call with the item `id` it received, so criterion 3 can check that the hand-off really happened. On the empty path, `session["error"]` holds the message, and `selected_item`, `outfit_suggestion` and `fit_card` stay `None`.
 
 ---
 
@@ -111,28 +112,49 @@
      1. One FULL query and its output, pasted as text.
      2. Your three per-tool terminal tests — the command and what it printed. -->
 
-**One full query**
+**One full query** (example wardrobe)
 
 ```
-$ python app.py ask '...'
+$ python app.py ask 'a vintage graphic tee under $30, size M'
+  Found:    Y2K Baby Tee — Butterfly Print — $18.0 on depop
 
+  Outfit:   Outfit 1: Y2K Baby Tee — Butterfly Print paired with Baggy straight-leg jeans, dark wash, Vintage black denim jacket, and Chunky white sneakers.
+
+Outfit 2: Y2K Baby Tee — Butterfly Print paired with Wide-leg khaki trousers, Black cropped zip hoodie, and Black combat boots.
+
+  Fit card: Scored the cutest little butterfly tee on depop for just $18 and I am obsessed. It gives major early 2000s mall-rat energy, especially styled with baggy denim and chunky sneakers. Going to live in this all season. #y2kstyle #thriftfinds
+
+0 model calls this session, 2 served from cache
+```
+
+The "served from cache" line is there because this exact query had already run once. The first run made 2 real model calls.
+
+**The empty path**, which stops after `search_listings` with 0 model calls:
+
+```
+$ python app.py ask 'designer ballgown size XXS under $5'
+  No listings matched "designer ballgown", under $5, size XXS. To find something, try: raise the price above $5 (most listings are $15–$50); drop the size XXS filter or try a neighbouring size; use broader keywords — e.g. a category like tee, jacket, jeans, sneakers, or a style like vintage, 90s, y2k, grunge.
+
+0 model calls this session
 ```
 
 **The three tools, tested one at a time**
 
 ```
-$ python -c "from tools import search_listings; print(search_listings('graphic tee', max_price=30))"
-
+$ python -c "from tools import search_listings; print([(r['id'], r['title'], r['size'], r['price']) for r in search_listings('graphic tee', max_price=30)])"
+[('lst_006', 'Graphic Tee — 2003 Tour Bootleg Style', 'L', 24.0), ('lst_002', 'Y2K Baby Tee — Butterfly Print', 'S/M', 18.0), ('lst_033', 'Vintage Band Tee — Faded Grey', 'L', 19.0), ('lst_015', 'Vintage Graphic Hoodie — Faded Black', 'L', 26.0), ('lst_017', 'Mesh Long-Sleeve Top — Black', 'S/M', 15.0), ('lst_011', 'Low-Rise Cargo Pants — Khaki', 'W29', 27.0)]
 ```
 
 ```
-$ python -c "from tools import suggest_outfit; ..."
+$ python -c "from tools import suggest_outfit; from utils.data_loader import get_example_wardrobe, load_listings; print(suggest_outfit(load_listings()[0], get_example_wardrobe()))"
+Outfit 1: Vintage Levi's 501 Jeans — Medium Wash paired with White ribbed tank top, Black cropped zip hoodie, and Chunky white sneakers.
 
+Outfit 2: Vintage Levi's 501 Jeans — Medium Wash paired with Oversized grey crewneck sweatshirt, Brown leather belt, and Black combat boots.
 ```
 
 ```
-$ python -c "from tools import create_fit_card; ..."
-
+$ python -c "from tools import create_fit_card; from utils.data_loader import load_listings; print(create_fit_card('jeans and white sneakers', load_listings()[0]))"
+Scored these vintage Levi's 501s on depop for just $38 and I am obsessed. The medium wash and broken-in fade at the knees give them that ultimate effortless streetwear vibe. Can't wait to style them with my favorite white sneakers on repeat. #vintagelevis #denimstyle
 ```
 
 ---
@@ -146,17 +168,17 @@ $ python -c "from tools import create_fit_card; ..."
      "I gave Claude my search_listings spec. It returned None on no match
      instead of an empty list, so I changed it" is the level we want. -->
 
-**Moment 1**
+**Moment 1: the query parser**
 
-- *What I asked for:*
-- *What came back:*
-- *What I changed:*
+- *What I asked for:* I had Claude Code write `parse_query` in `agent.py`, a regex that pulls `size` and `max_price` out of the query, and run it on the five phrasings in my criterion 5.
+- *What came back:* Size and price parsed correctly in all five, but `90s track jacket in size M` left the description as `"90s track jacket in"`. The size regex consumed `size M` but not the `in` before it.
+- *What I changed:* I made the size pattern also consume an optional leading `in ` (`(?:\bin\s+)?\bsize\s+...`) and re-ran it. The description became `"90s track jacket"`. Search happened to work either way, because `in` is a stopword, but criterion 5 checks `session["parsed"]`, so the leftover word would have counted against it.
 
-**Moment 2**
+**Moment 2: checking the fit cards for invented details**
 
-- *What I asked for:*
-- *What came back:*
-- *What I changed:*
+- *What I asked for:* I ran all five example queries through `app.py ask` and read the fit cards. Two of them named brands ("vintage Champion track jacket", "vintage Wrangler cropped denim jacket") that weren't in the query.
+- *What came back:* I suspected the model was making brands up. I had Claude check the listings, and `lst_004` really is `Champion` and `lst_007` really is `Wrangler`. `_describe_item` in `tools.py` passes the brand to the model only when it isn't `None`, and the platform-sneaker card (brand `None`) named no brand.
+- *What I changed:* Nothing in the prompt. The brand handling was already right, and I left it alone. What I did change was the plan for criterion 4: in unit 4 I'll check fit cards against the listing's fields, not just for price and platform, because a hallucinated brand would look just as confident as a real one.
 
 <!-- ═══════════════════════ UNIT 4 — THE TEST ═══════════════════════
 
